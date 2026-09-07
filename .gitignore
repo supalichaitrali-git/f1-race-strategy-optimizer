@@ -2,43 +2,29 @@
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
 
 # Virtual environment
 .venv/
 venv/
 env/
 
-# Environment variables and secrets
+# Environment variables
 .env
 
-# FastF1 cache
-.cache/
-fastf1_cache/
+# FastF1 cache and downloaded race data
+data/raw/
+data/processed/
 
-# Data files
-data/raw/*
-data/processed/*
-*.csv
-*.parquet
-*.db
-*.sqlite
-*.sqlite3
+# Trained machine learning models
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/*.keras
 
-# Keep folder structure
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+# Jupyter
+.ipynb_checkpoints/
 
-# Machine learning models
-models/*
-!models/.gitkeep
-
-# Testing / coverage
-.pytest_cache/
-.coverage
-htmlcov/
-
-# IDE / editor
+# IDE
 .vscode/
 .idea/
 
