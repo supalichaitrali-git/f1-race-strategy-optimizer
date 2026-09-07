@@ -1,7 +1,8 @@
 """
 FastF1 data loader for the F1 Race Strategy Optimizer.
 
-Loads historical F1 race lap data and stores a local CSV copy.
+Loads historical F1 race lap and weather data
+and stores local CSV copies.
 """
 
 from pathlib import Path
@@ -9,12 +10,19 @@ from pathlib import Path
 import fastf1
 
 
-# Local cache for FastF1 files
+# -------------------------------------------------------------------
+# FastF1 cache
+# -------------------------------------------------------------------
+
 CACHE_DIR = Path("data/raw/fastf1_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 fastf1.Cache.enable_cache(str(CACHE_DIR))
 
+
+# -------------------------------------------------------------------
+# Load race
+# -------------------------------------------------------------------
 
 def load_race(
     year: int = 2024,
@@ -47,7 +55,7 @@ def load_race(
 
     session.load(
         telemetry=False,
-        weather=False,
+        weather=True,
         messages=False,
     )
 
@@ -56,16 +64,24 @@ def load_race(
     return session
 
 
+# -------------------------------------------------------------------
+# Save lap data
+# -------------------------------------------------------------------
+
 def save_laps(
     session,
     output_file: str = "data/raw/2024_monza_laps.csv",
-):
+) -> None:
     """
     Save race lap data to CSV.
     """
 
     output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     laps = session.laps.copy()
 
@@ -78,14 +94,65 @@ def save_laps(
     print(f"File: {output_path}")
 
 
+# -------------------------------------------------------------------
+# Save weather data
+# -------------------------------------------------------------------
+
+def save_weather(
+    session,
+    output_file: str = "data/raw/2024_monza_weather.csv",
+) -> None:
+    """
+    Save race weather data to CSV.
+    """
+
+    output_path = Path(output_file)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    weather = session.weather_data.copy()
+
+    weather.to_csv(
+        output_path,
+        index=False,
+    )
+
+    print(f"Saved {len(weather)} weather records.")
+    print(f"File: {output_path}")
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
 if __name__ == "__main__":
 
-    race = load_race()
+    YEAR = 2024
+    EVENT = "Monza"
+
+    race = load_race(
+        YEAR,
+        EVENT,
+    )
 
     print()
     print("Race:", race.event.EventName)
     print("Year:", race.event.EventDate.year)
     print("Drivers:", len(race.drivers))
     print("Lap records:", len(race.laps))
+    print("Weather records:", len(race.weather_data))
 
-    save_laps(race)
+    print()
+
+    save_laps(
+        race,
+        f"data/raw/{YEAR}_monza_laps.csv",
+    )
+
+    save_weather(
+        race,
+        f"data/raw/{YEAR}_monza_weather.csv",
+    )
