@@ -1,9 +1,12 @@
 """
 Multi-season FastF1 data loader.
 
-Automatically discovers completed F1 races for a season,
-downloads lap and weather data, and skips races that
-have already been downloaded.
+Automatically discovers completed F1 Grand Prix races for a season,
+downloads lap and weather data, and skips races that have already
+been downloaded.
+
+Testing sessions, pre-season tests, and non-race track sessions
+are excluded.
 """
 
 from datetime import datetime
@@ -31,7 +34,7 @@ def get_completed_races(
     year: int,
 ) -> list[tuple[str, str]]:
     """
-    Get completed F1 race events for a season.
+    Get completed F1 Grand Prix races for a season.
 
     Parameters
     ----------
@@ -53,24 +56,48 @@ def get_completed_races(
     for _, event in schedule.iterrows():
 
         event_name = str(event["EventName"])
+        event_name_lower = event_name.lower()
+
         event_date = event["EventDate"]
 
-        # Convert pandas Timestamp to Python date.
+        # -----------------------------------------------------------
+        # Convert pandas Timestamp to Python date
+        # -----------------------------------------------------------
+
         if hasattr(event_date, "date"):
             event_date = event_date.date()
 
-        # Ignore future events.
+        # -----------------------------------------------------------
+        # Ignore future events
+        # -----------------------------------------------------------
+
         if event_date > today:
             continue
 
-        # Ignore testing events.
-        if "testing" in event_name.lower():
+        # -----------------------------------------------------------
+        # Ignore testing and non-race sessions
+        # -----------------------------------------------------------
+
+        excluded_keywords = [
+            "testing",
+            "pre-season test",
+            "pre season test",
+            "track session",
+            "test",
+        ]
+
+        if any(
+            keyword in event_name_lower
+            for keyword in excluded_keywords
+        ):
             continue
 
-        # Create a filesystem-safe name.
+        # -----------------------------------------------------------
+        # Create filesystem-safe file name
+        # -----------------------------------------------------------
+
         safe_name = (
-            event_name
-            .lower()
+            event_name_lower
             .replace(" grand prix", "")
             .replace(" ", "_")
             .replace("-", "_")
@@ -96,7 +123,7 @@ def download_race(
     safe_name: str,
 ) -> bool:
     """
-    Download lap and weather data for one race.
+    Download lap and weather data for one Grand Prix.
 
     Returns
     -------
@@ -203,7 +230,7 @@ def download_season(
     year: int,
 ) -> None:
     """
-    Discover and download all completed races
+    Discover and download all completed Grand Prix races
     for one F1 season.
     """
 
@@ -260,9 +287,11 @@ def download_season(
     print(
         f"Successful/skipped: {successful}"
     )
+
     print(
         f"Failed: {failed}"
     )
+
     print(
         f"Total races: {len(races)}"
     )
