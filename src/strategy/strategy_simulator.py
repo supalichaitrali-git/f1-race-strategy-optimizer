@@ -1,7 +1,7 @@
 """
 F1 race strategy simulator.
 
-Simulates a race using a sequence of tire compounds.
+Simulates a race using tire compounds and custom stint lengths.
 """
 
 from dataclasses import dataclass
@@ -14,6 +14,7 @@ class StrategyResult:
     """Result of simulating one race strategy."""
 
     strategy: list[str]
+    stint_lengths: list[int]
     total_time: float
     pit_stops: int
 
@@ -56,22 +57,74 @@ class StrategySimulator:
             for i in range(number_of_stints)
         ]
 
-    def simulate(self, strategy: list[str]) -> StrategyResult:
-        """Simulate a race using the supplied tire strategy."""
+    def validate_stints(
+        self,
+        strategy: list[str],
+        stint_lengths: list[int],
+    ) -> None:
+        """Validate a strategy with custom stint lengths."""
 
         if not strategy:
             raise ValueError("Strategy cannot be empty.")
 
-        stint_lengths = self._get_stint_lengths(len(strategy))
+        if len(strategy) != len(stint_lengths):
+            raise ValueError(
+                "Strategy and stint lengths must have the same number of stints."
+            )
+
+        if sum(stint_lengths) != self.total_laps:
+            raise ValueError(
+                "Stint lengths must add up to the total race laps."
+            )
 
         for compound, stint_length in zip(strategy, stint_lengths):
-            max_age = self.tire_model.max_tire_age[compound.upper()]
+
+            compound = compound.upper()
+
+            if compound not in self.tire_model.max_tire_age:
+                raise ValueError(
+                    f"Unknown tire compound: {compound}"
+                )
+
+            if stint_length < self.min_stint_laps:
+                raise ValueError(
+                    f"{compound} stint is too short: "
+                    f"{stint_length} laps."
+                )
+
+            if stint_length > self.max_stint_laps:
+                raise ValueError(
+                    f"{compound} stint is too long: "
+                    f"{stint_length} laps."
+                )
+
+            max_age = self.tire_model.max_tire_age[compound]
 
             if stint_length - 1 > max_age:
                 raise ValueError(
                     f"{compound} stint of {stint_length} laps "
                     f"exceeds maximum tire age of {max_age} laps."
                 )
+
+    def simulate(
+        self,
+        strategy: list[str],
+        stint_lengths: list[int] | None = None,
+    ) -> StrategyResult:
+        """
+        Simulate a race using the supplied tire strategy.
+
+        If stint_lengths are not provided, the race distance is divided
+        into balanced stints for backwards compatibility.
+        """
+
+        if not strategy:
+            raise ValueError("Strategy cannot be empty.")
+
+        if stint_lengths is None:
+            stint_lengths = self._get_stint_lengths(len(strategy))
+
+        self.validate_stints(strategy, stint_lengths)
 
         pit_stops = len(strategy) - 1
         total_time = 0.0
@@ -95,6 +148,7 @@ class StrategySimulator:
 
         return StrategyResult(
             strategy=strategy,
+            stint_lengths=stint_lengths,
             total_time=total_time,
             pit_stops=pit_stops,
         )
