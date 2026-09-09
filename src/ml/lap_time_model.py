@@ -1,9 +1,20 @@
 """
-Production lap-time prediction model for the F1 Race Strategy Optimizer.
+Counterfactual F1 lap-time model.
 
-The model predicts lap time using only information available before
-the lap is driven. Sector times and other post-lap information are
-intentionally excluded to prevent data leakage.
+The model separates race/context pace from tire effects so that
+the strategy optimizer can evaluate hypothetical tire choices.
+
+Architecture:
+
+    Context Model
+        ↓
+    Expected race pace without tire information
+        ↓
+    Tire Effect Model
+        ↓
+    Compound + tire-age adjustment
+        ↓
+    Counterfactual lap-time prediction
 """
 
 from pathlib import Path
@@ -14,10 +25,11 @@ import pandas as pd
 
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, StandardScaler
+from sklearn.metrics import mean_absolute_error, r2_score
 
 
 DATA_FILE = Path(
@@ -28,125 +40,147 @@ MODEL_FILE = Path(
     "models/lap_time_model.joblib"
 )
 
-COMPOUNDS = [
+SUPPORTED_COMPOUNDS = [
     "SOFT",
     "MEDIUM",
     "HARD",
 ]
 
 
-NUMERIC_FEATURES = [
-    "TyreLife",
-    "LapNumber",
-    "RaceProgress",
-    "TrackTemp",
-    "AirTemp",
-    "Humidity",
-    "WindSpeed",
-]
-
-
-CATEGORICAL_FEATURES = [
-    "Compound",
-    "Driver",
-    "GrandPrix",
-    "Season",
-]
-
-
-TARGET = "LapTimeSec"
-
-
-def load_data() -> pd.DataFrame:
-    """Load and prepare clean race data."""
+def load_dataset():
+    """Load and prepare the processed F1 dataset."""
 
     if not DATA_FILE.exists():
         raise FileNotFoundError(
             f"Dataset not found: {DATA_FILE}"
         )
 
-    df = pd.read_csv(DATA_FILE)
+    data = pd.read_csv(
+        DATA_FILE
+    )
 
-    df = df[
-        df["Compound"].isin(COMPOUNDS)
+    data = data[
+        data["Compound"].isin(
+            SUPPORTED_COMPOUNDS
+        )
     ].copy()
 
-    df = df[
-        df["TrackStatus"] == 1
+    data = data[
+        data["TrackStatus"] == 1
     ].copy()
 
-    df = df[
-        (df["LapTimeSec"] > 0)
-        & (df["LapTimeSec"] <= 120)
+    data = data[
+        data["LapTimeSec"].notna()
+        & data["TyreLife"].notna()
+        & data["LapNumber"].notna()
+        & data["Driver"].notna()
+        & data["GrandPrix"].notna()
+        & data["Season"].notna()
     ].copy()
 
-    df = df.dropna(
-        subset=[
-            TARGET,
-            "TyreLife",
-            "LapNumber",
-            "Compound",
-            "Driver",
-            "GrandPrix",
-            "Season",
+    data["RaceKey"] = (
+        data["Season"].astype(str)
+        + "_"
+        + data["GrandPrix"].astype(str)
+    )
+
+    data["RaceProgress"] = (
+        data["LapNumber"]
+        / data.groupby("RaceKey")["LapNumber"].transform("max")
+    )
+
+    data["TyreLife"] = (
+        data["TyreLife"].astype(int)
+    )
+
+    data["LapNumber"] = (
+        data["LapNumber"].astype(int)
+    )
+
+    data["Season"] = (
+        data["Season"].astype(int)
+    )
+
+    return data
+
+
+def split_by_race(data):
+    """Create a chronological unseen-race split."""
+
+    races = (
+        data[
+            [
+                "Season",
+                "GrandPrix",
+                "RaceKey",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            [
+                "Season",
+                "GrandPrix",
+            ]
+        )
+    )
+
+    split_index = int(
+        len(races) * 0.80
+    )
+
+    training_races = set(
+        races.iloc[:split_index][
+            "RaceKey"
         ]
     )
 
-    df["RaceKey"] = (
-        df["Season"].astype(str)
-        + "_"
-        + df["GrandPrix"].astype(str)
+    testing_races = set(
+        races.iloc[split_index:][
+            "RaceKey"
+        ]
     )
 
-    df["RaceProgress"] = (
-        df["LapNumber"]
-        / df.groupby("RaceKey")["LapNumber"]
-        .transform("max")
-    )
-
-    return df
-
-
-def split_by_race(
-    df: pd.DataFrame,
-    test_fraction: float = 0.20,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Split data by complete races.
-
-    This prevents laps from the same race appearing in both
-    training and testing data.
-    """
-
-    races = (
-        df["RaceKey"]
-        .drop_duplicates()
-        .sort_values()
-        .tolist()
-    )
-
-    test_count = max(
-        1,
-        int(len(races) * test_fraction),
-    )
-
-    test_races = set(
-        races[-test_count:]
-    )
-
-    train_df = df[
-        ~df["RaceKey"].isin(test_races)
+    train = data[
+        data["RaceKey"].isin(
+            training_races
+        )
     ].copy()
 
-    test_df = df[
-        df["RaceKey"].isin(test_races)
+    test = data[
+        data["RaceKey"].isin(
+            testing_races
+        )
     ].copy()
 
-    return train_df, test_df
+    return (
+        train,
+        test,
+        training_races,
+        testing_races,
+    )
 
 
-def build_pipeline() -> Pipeline:
-    """Build the machine-learning pipeline."""
+def build_context_model():
+    """
+    Build a model that predicts race pace without tire information.
+
+    Tire compound and tire age are deliberately excluded.
+    """
+
+    numeric_features = [
+        "LapNumber",
+        "RaceProgress",
+        "TrackTemp",
+        "AirTemp",
+        "Humidity",
+        "WindSpeed",
+    ]
+
+    categorical_features = [
+        "Driver",
+        "GrandPrix",
+        "Season",
+    ]
 
     numeric_pipeline = Pipeline(
         steps=[
@@ -185,21 +219,17 @@ def build_pipeline() -> Pipeline:
             (
                 "numeric",
                 numeric_pipeline,
-                NUMERIC_FEATURES,
+                numeric_features,
             ),
             (
                 "categorical",
                 categorical_pipeline,
-                CATEGORICAL_FEATURES,
+                categorical_features,
             ),
         ]
     )
 
-    model = Ridge(
-        alpha=10.0
-    )
-
-    pipeline = Pipeline(
+    model = Pipeline(
         steps=[
             (
                 "preprocessor",
@@ -207,102 +237,449 @@ def build_pipeline() -> Pipeline:
             ),
             (
                 "model",
-                model,
+                Ridge(
+                    alpha=20.0
+                ),
             ),
         ]
     )
 
-    return pipeline
+    return model
 
 
-def train_model(
-    train_df: pd.DataFrame,
-) -> Pipeline:
-    """Train the lap-time prediction model."""
+def build_tire_effect_model():
+    """
+    Build a model for tire-related residual effects.
 
-    features = (
-        NUMERIC_FEATURES
-        + CATEGORICAL_FEATURES
-    )
+    Tire age uses polynomial features so the relationship can be
+    nonlinear. Compound is interacted with tire age explicitly.
+    """
 
-    X_train = train_df[
-        features
+    numeric_features = [
+        "TyreLife",
+        "TyreLifeSquared",
+        "CompoundTyreLife",
+        "CompoundTyreLifeSquared",
     ]
 
-    y_train = train_df[
-        TARGET
+    categorical_features = [
+        "Compound",
     ]
 
-    pipeline = build_pipeline()
-
-    pipeline.fit(
-        X_train,
-        y_train,
+    numeric_pipeline = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="median"
+                ),
+            ),
+            (
+                "scaler",
+                StandardScaler(),
+            ),
+        ]
     )
 
-    return pipeline
-
-
-def evaluate_model(
-    model: Pipeline,
-    test_df: pd.DataFrame,
-) -> None:
-    """Evaluate predictions on completely unseen races."""
-
-    features = (
-        NUMERIC_FEATURES
-        + CATEGORICAL_FEATURES
+    categorical_pipeline = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="most_frequent"
+                ),
+            ),
+            (
+                "encoder",
+                OneHotEncoder(
+                    handle_unknown="ignore"
+                ),
+            ),
+        ]
     )
 
-    X_test = test_df[
-        features
-    ]
-
-    y_test = test_df[
-        TARGET
-    ]
-
-    predictions = model.predict(
-        X_test
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "numeric",
+                numeric_pipeline,
+                numeric_features,
+            ),
+            (
+                "categorical",
+                categorical_pipeline,
+                categorical_features,
+            ),
+        ]
     )
 
-    r2 = r2_score(
-        y_test,
-        predictions,
+    model = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                preprocessor,
+            ),
+            (
+                "model",
+                Ridge(
+                    alpha=50.0
+                ),
+            ),
+        ]
     )
 
-    mae = mean_absolute_error(
-        y_test,
-        predictions,
+    return model
+
+
+def create_tire_features(data):
+    """Create tire-age interaction features."""
+
+    data = data.copy()
+
+    data["TyreLifeSquared"] = (
+        data["TyreLife"] ** 2
     )
+
+    data["CompoundTyreLife"] = (
+        data["TyreLife"]
+        * data["Compound"].map(
+            {
+                "SOFT": 1.0,
+                "MEDIUM": 2.0,
+                "HARD": 3.0,
+            }
+        )
+    )
+
+    data["CompoundTyreLifeSquared"] = (
+        data["TyreLifeSquared"]
+        * data["Compound"].map(
+            {
+                "SOFT": 1.0,
+                "MEDIUM": 2.0,
+                "HARD": 3.0,
+            }
+        )
+    )
+
+    return data
+
+
+def fit_model():
+    """Train the counterfactual lap-time model."""
 
     print()
     print("=" * 70)
-    print("UNSEEN-RACE MODEL PERFORMANCE")
+    print("COUNTERFACTUAL F1 LAP-TIME MODEL")
     print("=" * 70)
 
+    data = load_dataset()
+
     print(
-        f"R²  : {r2:.4f}"
+        f"Usable laps: {len(data):,}"
     )
 
     print(
-        f"MAE : {mae:.4f} sec"
+        f"Races: "
+        f"{data['RaceKey'].nunique():,}"
+    )
+
+    train, test, training_races, testing_races = (
+        split_by_race(data)
     )
 
     print(
-        f"Test laps : {len(test_df):,}"
+        f"Training laps: {len(train):,}"
     )
 
     print(
-        f"Test races: "
-        f"{test_df['RaceKey'].nunique():,}"
+        f"Testing laps : {len(test):,}"
     )
 
+    print(
+        f"Training races: "
+        f"{len(training_races):,}"
+    )
 
-def save_model(
-    model: Pipeline,
-) -> None:
-    """Save trained model to disk."""
+    print(
+        f"Testing races: "
+        f"{len(testing_races):,}"
+    )
+
+    # ------------------------------------------------------------
+    # STEP 1: CONTEXT MODEL
+    # ------------------------------------------------------------
+
+    print()
+    print(
+        "Training contextual race-pace model..."
+    )
+
+    context_model = (
+        build_context_model()
+    )
+
+    context_features = [
+        "LapNumber",
+        "RaceProgress",
+        "TrackTemp",
+        "AirTemp",
+        "Humidity",
+        "WindSpeed",
+        "Driver",
+        "GrandPrix",
+        "Season",
+    ]
+
+    context_model.fit(
+        train[context_features],
+        train["LapTimeSec"],
+    )
+
+    train["ContextPrediction"] = (
+        context_model.predict(
+            train[context_features]
+        )
+    )
+
+    test["ContextPrediction"] = (
+        context_model.predict(
+            test[context_features]
+        )
+    )
+
+    train["TireResidual"] = (
+        train["LapTimeSec"]
+        - train["ContextPrediction"]
+    )
+
+    test["TireResidual"] = (
+        test["LapTimeSec"]
+        - test["ContextPrediction"]
+    )
+
+    # ------------------------------------------------------------
+    # STEP 2: TIRE EFFECT MODEL
+    # ------------------------------------------------------------
+
+    print(
+        "Training tire-effect model..."
+    )
+
+    train = create_tire_features(
+        train
+    )
+
+    test = create_tire_features(
+        test
+    )
+
+    tire_model = (
+        build_tire_effect_model()
+    )
+
+    tire_features = [
+        "TyreLife",
+        "TyreLifeSquared",
+        "CompoundTyreLife",
+        "CompoundTyreLifeSquared",
+        "Compound",
+    ]
+
+    tire_model.fit(
+        train[tire_features],
+        train["TireResidual"],
+    )
+
+    train["TirePrediction"] = (
+        tire_model.predict(
+            train[tire_features]
+        )
+    )
+
+    test["TirePrediction"] = (
+        tire_model.predict(
+            test[tire_features]
+        )
+    )
+
+    train["FinalPrediction"] = (
+        train["ContextPrediction"]
+        + train["TirePrediction"]
+    )
+
+    test["FinalPrediction"] = (
+        test["ContextPrediction"]
+        + test["TirePrediction"]
+    )
+
+    # ------------------------------------------------------------
+    # STEP 3: MODEL PERFORMANCE
+    # ------------------------------------------------------------
+
+    train_r2 = r2_score(
+        train["LapTimeSec"],
+        train["FinalPrediction"],
+    )
+
+    train_mae = mean_absolute_error(
+        train["LapTimeSec"],
+        train["FinalPrediction"],
+    )
+
+    test_r2 = r2_score(
+        test["LapTimeSec"],
+        test["FinalPrediction"],
+    )
+
+    test_mae = mean_absolute_error(
+        test["LapTimeSec"],
+        test["FinalPrediction"],
+    )
+
+    print()
+    print(
+        "UNSEEN-RACE MODEL PERFORMANCE"
+    )
+
+    print(
+        f"Training R² : "
+        f"{train_r2:.4f}"
+    )
+
+    print(
+        f"Training MAE: "
+        f"{train_mae:.4f} sec"
+    )
+
+    print(
+        f"Test R²     : "
+        f"{test_r2:.4f}"
+    )
+
+    print(
+        f"Test MAE    : "
+        f"{test_mae:.4f} sec"
+    )
+
+    # ------------------------------------------------------------
+    # STEP 4: LEARN PHYSICALLY MONOTONIC DEGRADATION CURVES
+    # ------------------------------------------------------------
+
+    print()
+    print(
+        "LEARNED TIRE EFFECTS"
+    )
+
+    degradation_curves = {}
+
+    for compound in SUPPORTED_COMPOUNDS:
+
+        compound_data = train[
+            train["Compound"] == compound
+        ]
+
+        grouped = (
+            compound_data
+            .groupby("TyreLife")[
+                "TireResidual"
+            ]
+            .median()
+            .reset_index()
+        )
+
+        if grouped.empty:
+            continue
+
+        x = grouped[
+            "TyreLife"
+        ].to_numpy()
+
+        y = grouped[
+            "TireResidual"
+        ].to_numpy()
+
+        isotonic = IsotonicRegression(
+            increasing=True,
+            out_of_bounds="clip",
+        )
+
+        isotonic.fit(
+            x,
+            y,
+        )
+
+        ages = np.arange(
+            1,
+            41,
+        )
+
+        values = isotonic.predict(
+            ages
+        )
+
+        values = (
+            values
+            - values[0]
+        )
+
+        # Prevent the learned degradation curve from
+        # decreasing with tire age.
+        values = np.maximum.accumulate(
+            values
+        )
+
+        degradation_curves[
+            compound
+        ] = {
+            int(age): float(value)
+            for age, value in zip(
+                ages,
+                values,
+            )
+        }
+
+        print()
+        print(
+            f"{compound}:"
+        )
+
+        for age in [
+            1,
+            5,
+            10,
+            15,
+            20,
+            25,
+            30,
+            35,
+            40,
+        ]:
+
+            if age in degradation_curves[
+                compound
+            ]:
+                print(
+                    f"Age {age:>2}: "
+                    f"{degradation_curves[compound][age]:+.4f} sec"
+                )
+
+    # ------------------------------------------------------------
+    # SAVE MODEL
+    # ------------------------------------------------------------
+
+    model_package = {
+        "context_model": context_model,
+        "tire_model": tire_model,
+        "degradation_curves": degradation_curves,
+        "context_features": context_features,
+        "tire_features": tire_features,
+        "supported_compounds": SUPPORTED_COMPOUNDS,
+        "train_r2": train_r2,
+        "train_mae": train_mae,
+        "test_r2": test_r2,
+        "test_mae": test_mae,
+    }
 
     MODEL_FILE.parent.mkdir(
         parents=True,
@@ -310,7 +687,7 @@ def save_model(
     )
 
     joblib.dump(
-        model,
+        model_package,
         MODEL_FILE,
     )
 
@@ -319,79 +696,10 @@ def save_model(
         f"Saved model: {MODEL_FILE}"
     )
 
-
-def main() -> None:
-    """Train and evaluate the production lap-time model."""
-
-    print()
-    print("=" * 70)
-    print("F1 LAP-TIME PREDICTION MODEL")
     print("=" * 70)
 
-    print()
-    print("Loading data...")
-
-    df = load_data()
-
-    print(
-        f"Usable laps: {len(df):,}"
-    )
-
-    print(
-        f"Races: "
-        f"{df['RaceKey'].nunique():,}"
-    )
-
-    print()
-    print("Splitting by complete races...")
-
-    train_df, test_df = split_by_race(
-        df
-    )
-
-    print(
-        f"Training laps: {len(train_df):,}"
-    )
-
-    print(
-        f"Testing laps : {len(test_df):,}"
-    )
-
-    print(
-        f"Training races: "
-        f"{train_df['RaceKey'].nunique():,}"
-    )
-
-    print(
-        f"Testing races : "
-        f"{test_df['RaceKey'].nunique():,}"
-    )
-
-    print()
-    print("Training model...")
-
-    model = train_model(
-        train_df
-    )
-
-    print(
-        "Model training complete."
-    )
-
-    evaluate_model(
-        model,
-        test_df,
-    )
-
-    save_model(
-        model
-    )
-
-    print()
-    print("=" * 70)
-    print("MODEL TRAINING COMPLETE")
-    print("=" * 70)
+    return model_package
 
 
 if __name__ == "__main__":
-    main()
+    fit_model()

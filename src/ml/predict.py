@@ -1,8 +1,8 @@
 """
 Prediction interface for the F1 Race Strategy Optimizer.
 
-Provides a simple function for predicting lap time using the
-trained production model.
+Provides single and batch lap-time prediction using the trained
+production ML model.
 """
 
 from pathlib import Path
@@ -14,6 +14,12 @@ import pandas as pd
 MODEL_FILE = Path(
     "models/lap_time_model.joblib"
 )
+
+SUPPORTED_COMPOUNDS = {
+    "SOFT",
+    "MEDIUM",
+    "HARD",
+}
 
 
 def load_model():
@@ -29,32 +35,17 @@ def load_model():
     )
 
 
-def predict_lap_time(
-    model,
+def _validate_prediction_inputs(
     compound: str,
     tyre_age: int,
     lap_number: int,
     race_progress: float,
-    track_temp: float,
-    air_temp: float,
-    humidity: float,
-    wind_speed: float,
-    driver: str,
-    grand_prix: str,
-    season: int,
-) -> float:
-    """
-    Predict the expected lap time.
+) -> str:
+    """Validate common prediction inputs."""
 
-    All inputs represent information available before
-    the lap is driven.
-    """
+    compound = compound.upper()
 
-    if compound.upper() not in {
-        "SOFT",
-        "MEDIUM",
-        "HARD",
-    }:
+    if compound not in SUPPORTED_COMPOUNDS:
         raise ValueError(
             f"Unsupported compound: {compound}"
         )
@@ -74,6 +65,37 @@ def predict_lap_time(
             "Race progress must be between 0 and 1."
         )
 
+    return compound
+
+
+def predict_lap_time(
+    model,
+    compound: str,
+    tyre_age: int,
+    lap_number: int,
+    race_progress: float,
+    track_temp: float,
+    air_temp: float,
+    humidity: float,
+    wind_speed: float,
+    driver: str,
+    grand_prix: str,
+    season: int,
+) -> float:
+    """
+    Predict one lap time.
+
+    All inputs represent information available before
+    the lap is driven.
+    """
+
+    compound = _validate_prediction_inputs(
+        compound,
+        tyre_age,
+        lap_number,
+        race_progress,
+    )
+
     input_data = pd.DataFrame(
         [
             {
@@ -84,7 +106,7 @@ def predict_lap_time(
                 "AirTemp": air_temp,
                 "Humidity": humidity,
                 "WindSpeed": wind_speed,
-                "Compound": compound.upper(),
+                "Compound": compound,
                 "Driver": driver,
                 "GrandPrix": grand_prix,
                 "Season": season,
@@ -101,6 +123,79 @@ def predict_lap_time(
     )
 
 
+def predict_lap_times_batch(
+    model,
+    predictions: list[dict],
+) -> list[float]:
+    """
+    Predict multiple lap times in one model call.
+
+    Each dictionary must contain the same features used
+    by the production lap-time model.
+    """
+
+    if not predictions:
+        raise ValueError(
+            "Prediction list cannot be empty."
+        )
+
+    validated_predictions = []
+
+    for item in predictions:
+
+        compound = _validate_prediction_inputs(
+            item["Compound"],
+            int(item["TyreLife"]),
+            int(item["LapNumber"]),
+            float(item["RaceProgress"]),
+        )
+
+        validated_predictions.append(
+            {
+                "TyreLife": int(
+                    item["TyreLife"]
+                ),
+                "LapNumber": int(
+                    item["LapNumber"]
+                ),
+                "RaceProgress": float(
+                    item["RaceProgress"]
+                ),
+                "TrackTemp": float(
+                    item["TrackTemp"]
+                ),
+                "AirTemp": float(
+                    item["AirTemp"]
+                ),
+                "Humidity": float(
+                    item["Humidity"]
+                ),
+                "WindSpeed": float(
+                    item["WindSpeed"]
+                ),
+                "Compound": compound,
+                "Driver": item["Driver"],
+                "GrandPrix": item["GrandPrix"],
+                "Season": int(
+                    item["Season"]
+                ),
+            }
+        )
+
+    input_data = pd.DataFrame(
+        validated_predictions
+    )
+
+    predictions = model.predict(
+        input_data
+    )
+
+    return [
+        float(value)
+        for value in predictions
+    ]
+
+
 def predict(
     compound: str,
     tyre_age: int,
@@ -115,7 +210,7 @@ def predict(
     season: int,
 ) -> float:
     """
-    Load the trained model and predict lap time.
+    Load the trained model and predict one lap time.
     """
 
     model = load_model()
@@ -137,7 +232,11 @@ def predict(
 
 
 if __name__ == "__main__":
-    prediction = predict(
+
+    model = load_model()
+
+    single_prediction = predict_lap_time(
+        model=model,
         compound="MEDIUM",
         tyre_age=5,
         lap_number=20,
@@ -151,7 +250,68 @@ if __name__ == "__main__":
         season=2025,
     )
 
-    print(
-        f"Predicted lap time: "
-        f"{prediction:.3f} seconds"
+    batch_predictions = predict_lap_times_batch(
+        model=model,
+        predictions=[
+            {
+                "TyreLife": 1,
+                "LapNumber": 1,
+                "RaceProgress": 1 / 53,
+                "TrackTemp": 35.0,
+                "AirTemp": 25.0,
+                "Humidity": 50.0,
+                "WindSpeed": 3.0,
+                "Compound": "MEDIUM",
+                "Driver": "VER",
+                "GrandPrix": "Italian Grand Prix",
+                "Season": 2025,
+            },
+            {
+                "TyreLife": 2,
+                "LapNumber": 2,
+                "RaceProgress": 2 / 53,
+                "TrackTemp": 35.0,
+                "AirTemp": 25.0,
+                "Humidity": 50.0,
+                "WindSpeed": 3.0,
+                "Compound": "MEDIUM",
+                "Driver": "VER",
+                "GrandPrix": "Italian Grand Prix",
+                "Season": 2025,
+            },
+            {
+                "TyreLife": 3,
+                "LapNumber": 3,
+                "RaceProgress": 3 / 53,
+                "TrackTemp": 35.0,
+                "AirTemp": 25.0,
+                "Humidity": 50.0,
+                "WindSpeed": 3.0,
+                "Compound": "MEDIUM",
+                "Driver": "VER",
+                "GrandPrix": "Italian Grand Prix",
+                "Season": 2025,
+            },
+        ],
     )
+
+    print()
+    print("=" * 70)
+    print("PREDICTION INTERFACE TEST")
+    print("=" * 70)
+
+    print(
+        f"Single prediction: "
+        f"{single_prediction:.3f} sec"
+    )
+
+    print(
+        "Batch predictions: "
+        + ", ".join(
+            f"{value:.3f}"
+            for value in batch_predictions
+        )
+        + " sec"
+    )
+
+    print("=" * 70)

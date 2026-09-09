@@ -1,28 +1,21 @@
 """
 F1 race strategy simulator.
 
-Uses the trained lap-time prediction model to estimate the
-time required for every lap of a proposed tire strategy.
+Uses cached batch ML predictions so that strategy evaluation
+does not repeatedly call the sklearn model for every lap.
 """
 
-from dataclasses import dataclass
+from pathlib import Path
 
-from src.ml.predict import load_model, predict_lap_time
+from src.ml.predict import (
+    load_model,
+    predict_lap_times_batch,
+)
 from src.strategy.tire_model import TireModel
 
 
-@dataclass
-class StrategyResult:
-    """Result of simulating one race strategy."""
-
-    strategy: list[str]
-    stint_lengths: list[int]
-    total_time: float
-    pit_stops: int
-
-
 class StrategySimulator:
-    """Simulate F1 race strategies using the ML lap-time model."""
+    """Simulate F1 race strategies using the trained lap-time model."""
 
     def __init__(
         self,
@@ -42,19 +35,102 @@ class StrategySimulator:
         self.driver = driver
         self.grand_prix = grand_prix
         self.season = season
+
         self.track_temp = track_temp
         self.air_temp = air_temp
         self.humidity = humidity
         self.wind_speed = wind_speed
+
         self.pit_stop_loss = pit_stop_loss
         self.min_stint_laps = min_stint_laps
         self.max_stint_laps = max_stint_laps
 
         self.tire_model = TireModel()
+
         self.model = load_model()
+
+        # Predictions are generated once and reused by every strategy.
+        self._prediction_cache = {}
+
+        self._build_prediction_cache()
+
+    def _build_prediction_cache(self):
+        """Precompute all valid lap-time predictions needed by the simulator."""
+
+        predictions = []
+
+        compounds = [
+            "SOFT",
+            "MEDIUM",
+            "HARD",
+        ]
+
+        for compound in compounds:
+
+            max_age = min(
+                self.max_stint_laps,
+                self.tire_model.max_tire_age[compound],
+            )
+
+            for lap_number in range(
+                1,
+                self.total_laps + 1,
+            ):
+
+                race_progress = (
+                    lap_number / self.total_laps
+                )
+
+                for tyre_age in range(
+                    1,
+                    max_age + 1,
+                ):
+
+                    # A tire cannot be older than the current lap.
+                    if tyre_age > lap_number:
+                        continue
+
+                    predictions.append(
+                        {
+                            "TyreLife": tyre_age,
+                            "LapNumber": lap_number,
+                            "RaceProgress": race_progress,
+                            "TrackTemp": self.track_temp,
+                            "AirTemp": self.air_temp,
+                            "Humidity": self.humidity,
+                            "WindSpeed": self.wind_speed,
+                            "Compound": compound,
+                            "Driver": self.driver,
+                            "GrandPrix": self.grand_prix,
+                            "Season": self.season,
+                        }
+                    )
+
+        predicted_values = predict_lap_times_batch(
+            model=self.model,
+            predictions=predictions,
+        )
+
+        for item, predicted_time in zip(
+            predictions,
+            predicted_values,
+        ):
+            key = (
+                item["Compound"],
+                item["LapNumber"],
+                item["TyreLife"],
+            )
+
+            self._prediction_cache[key] = predicted_time
+
+        print(
+            f"Prediction cache built: "
+            f"{len(self._prediction_cache):,} entries"
+        )
 
     def _get_stint_lengths(
         self,
+        total_laps: int,
         number_of_stints: int,
     ) -> list[int]:
         """Create balanced stint lengths."""
@@ -64,195 +140,191 @@ class StrategySimulator:
                 "Number of stints must be positive."
             )
 
-        if (
-            self.total_laps
-            < number_of_stints * self.min_stint_laps
-        ):
-            raise ValueError(
-                "Too many stints for the race distance."
-            )
+        minimum_laps = (
+            number_of_stints
+            * self.min_stint_laps
+        )
 
-        if (
-            self.total_laps
-            > number_of_stints * self.max_stint_laps
-        ):
+        if total_laps < minimum_laps:
             raise ValueError(
-                "Too few stints for the race distance."
+                "Race is too short for the requested "
+                "number of stints."
             )
 
         base_length = (
-            self.total_laps
-            // number_of_stints
+            total_laps // number_of_stints
         )
 
         remainder = (
-            self.total_laps
-            % number_of_stints
+            total_laps % number_of_stints
         )
 
-        return [
-            base_length
-            + (1 if i < remainder else 0)
-            for i in range(number_of_stints)
-        ]
+        lengths = []
+
+        for index in range(number_of_stints):
+
+            length = base_length
+
+            if index < remainder:
+                length += 1
+
+            lengths.append(length)
+
+        return lengths
 
     def validate_stints(
         self,
-        strategy: list[str],
+        compounds: list[str],
         stint_lengths: list[int],
-    ) -> None:
-        """Validate a strategy with custom stint lengths."""
+    ):
+        """Validate compounds and stint lengths."""
 
-        if not strategy:
+        if len(compounds) != len(stint_lengths):
             raise ValueError(
-                "Strategy cannot be empty."
-            )
-
-        if len(strategy) != len(stint_lengths):
-            raise ValueError(
-                "Strategy and stint lengths must have "
-                "the same number of stints."
+                "Number of compounds must match "
+                "number of stint lengths."
             )
 
         if sum(stint_lengths) != self.total_laps:
             raise ValueError(
-                "Stint lengths must add up to the "
-                "total race laps."
+                "Stint lengths must add up to "
+                f"{self.total_laps} laps."
             )
 
         for compound, stint_length in zip(
-            strategy,
+            compounds,
             stint_lengths,
         ):
+
             compound = compound.upper()
 
-            if compound not in self.tire_model.max_tire_age:
+            if compound not in {
+                "SOFT",
+                "MEDIUM",
+                "HARD",
+            }:
                 raise ValueError(
-                    f"Unknown tire compound: {compound}"
+                    f"Unsupported compound: {compound}"
                 )
 
             if stint_length < self.min_stint_laps:
                 raise ValueError(
-                    f"{compound} stint is too short: "
-                    f"{stint_length} laps."
+                    f"Stint length {stint_length} is below "
+                    f"minimum of {self.min_stint_laps} laps."
                 )
 
             if stint_length > self.max_stint_laps:
                 raise ValueError(
-                    f"{compound} stint is too long: "
-                    f"{stint_length} laps."
+                    f"Stint length {stint_length} exceeds "
+                    f"maximum of {self.max_stint_laps} laps."
                 )
 
-            max_age = (
-                self.tire_model.max_tire_age[
-                    compound
-                ]
-            )
-
-            if stint_length - 1 > max_age:
+            if not self.tire_model.is_tire_age_valid(
+                compound,
+                stint_length,
+            ):
                 raise ValueError(
-                    f"{compound} stint of "
-                    f"{stint_length} laps exceeds "
-                    f"maximum tire age of "
-                    f"{max_age} laps."
+                    f"{compound} stint of {stint_length} "
+                    "laps exceeds maximum tire age."
                 )
 
     def _predict_lap(
         self,
         compound: str,
-        tire_age: int,
+        tyre_age: int,
         lap_number: int,
     ) -> float:
-        """Predict the lap time for one race lap."""
+        """Retrieve a precomputed lap-time prediction."""
 
-        race_progress = (
-            lap_number / self.total_laps
+        key = (
+            compound.upper(),
+            lap_number,
+            tyre_age,
         )
 
-        return predict_lap_time(
-            model=self.model,
-            compound=compound,
-            tyre_age=tire_age,
-            lap_number=lap_number,
-            race_progress=race_progress,
-            track_temp=self.track_temp,
-            air_temp=self.air_temp,
-            humidity=self.humidity,
-            wind_speed=self.wind_speed,
-            driver=self.driver,
-            grand_prix=self.grand_prix,
-            season=self.season,
-        )
+        if key not in self._prediction_cache:
+            raise KeyError(
+                f"No cached prediction for "
+                f"{key}"
+            )
+
+        return self._prediction_cache[key]
 
     def simulate(
         self,
-        strategy: list[str],
-        stint_lengths: list[int] | None = None,
-    ) -> StrategyResult:
-        """
-        Simulate a complete race using the supplied strategy.
-
-        The ML model predicts each lap time using the tire compound,
-        tire age, race progress, weather, driver, circuit and season.
-        """
-
-        if not strategy:
-            raise ValueError(
-                "Strategy cannot be empty."
-            )
-
-        if stint_lengths is None:
-            stint_lengths = (
-                self._get_stint_lengths(
-                    len(strategy)
-                )
-            )
+        compounds: list[str],
+        stint_lengths: list[int],
+    ) -> dict:
+        """Simulate one complete race strategy."""
 
         self.validate_stints(
-            strategy,
+            compounds,
             stint_lengths,
         )
 
-        pit_stops = len(strategy) - 1
         total_time = 0.0
+        lap_records = []
 
-        lap_number = 1
+        current_lap = 1
 
-        for compound, stint_laps in zip(
-            strategy,
-            stint_lengths,
+        for stint_index, (
+            compound,
+            stint_length,
+        ) in enumerate(
+            zip(
+                compounds,
+                stint_lengths,
+            ),
+            start=1,
         ):
+
             compound = compound.upper()
 
-            tire_age = 1
+            for tyre_age in range(
+                1,
+                stint_length + 1,
+            ):
 
-            for _ in range(stint_laps):
+                lap_number = current_lap
 
-                lap_time = self._predict_lap(
-                    compound=compound,
-                    tire_age=tire_age,
-                    lap_number=lap_number,
+                predicted_lap_time = (
+                    self._predict_lap(
+                        compound=compound,
+                        tyre_age=tyre_age,
+                        lap_number=lap_number,
+                    )
                 )
 
-                total_time += lap_time
+                total_time += predicted_lap_time
 
-                tire_age += 1
-                lap_number += 1
+                lap_records.append(
+                    {
+                        "Lap": lap_number,
+                        "Stint": stint_index,
+                        "Compound": compound,
+                        "TyreAge": tyre_age,
+                        "PredictedLapTime": predicted_lap_time,
+                    }
+                )
 
-        total_time += (
-            pit_stops
-            * self.pit_stop_loss
-        )
+                current_lap += 1
 
-        return StrategyResult(
-            strategy=strategy,
-            stint_lengths=stint_lengths,
-            total_time=total_time,
-            pit_stops=pit_stops,
-        )
+            # Add pit-stop time between stints.
+            if stint_index < len(compounds):
+                total_time += self.pit_stop_loss
+
+        return {
+            "compounds": compounds,
+            "stint_lengths": stint_lengths,
+            "pit_stops": len(compounds) - 1,
+            "total_time": total_time,
+            "total_time_minutes": total_time / 60,
+            "laps": lap_records,
+        }
 
 
 if __name__ == "__main__":
+
     simulator = StrategySimulator(
         total_laps=53,
         driver="VER",
@@ -265,7 +337,7 @@ if __name__ == "__main__":
     )
 
     result = simulator.simulate(
-        strategy=[
+        compounds=[
             "MEDIUM",
             "HARD",
         ],
@@ -281,28 +353,28 @@ if __name__ == "__main__":
     print("=" * 70)
 
     print(
-        f"Strategy: "
-        f"{' -> '.join(result.strategy)}"
+        "Strategy: "
+        + " -> ".join(result["compounds"])
     )
 
     print(
         f"Stints: "
-        f"{result.stint_lengths}"
+        f"{result['stint_lengths']}"
     )
 
     print(
         f"Pit stops: "
-        f"{result.pit_stops}"
+        f"{result['pit_stops']}"
     )
 
     print(
         f"Predicted race time: "
-        f"{result.total_time:.2f} sec"
+        f"{result['total_time']:.2f} sec"
     )
 
     print(
         f"Predicted race time: "
-        f"{result.total_time / 60:.2f} min"
+        f"{result['total_time_minutes']:.2f} min"
     )
 
     print("=" * 70)

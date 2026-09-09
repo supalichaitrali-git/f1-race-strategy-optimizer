@@ -1,199 +1,343 @@
 """
 F1 race strategy optimizer.
 
-Generates, evaluates, ranks, and returns the best tire strategies
-using the ML-driven race strategy simulator.
+Generates and evaluates a large strategy space using the
+cached ML predictions from StrategySimulator.
 """
 
 from itertools import product
 
-from src.strategy.strategy_simulator import StrategyResult
 from src.strategy.strategy_simulator import StrategySimulator
 
 
 class StrategyOptimizer:
-    """Generate and evaluate possible F1 race strategies."""
+    """Find and rank the fastest expected F1 race strategies."""
 
-    def __init__(self, simulator: StrategySimulator):
+    def __init__(
+        self,
+        simulator: StrategySimulator,
+        compounds: list[str] | None = None,
+        min_stint_laps: int = 5,
+        max_stint_laps: int = 35,
+        max_stops: int = 3,
+    ):
         self.simulator = simulator
 
-    def generate_strategies(
-        self,
-        compounds: list[str] | None = None,
-        max_stops: int = 2,
-    ) -> list[tuple[list[str], list[int]]]:
-        """Generate tire strategies with variable stint lengths."""
-
-        if compounds is None:
-            compounds = [
+        self.compounds = (
+            compounds
+            if compounds is not None
+            else [
                 "SOFT",
                 "MEDIUM",
                 "HARD",
             ]
+        )
 
-        strategies = []
+        self.compounds = [
+            compound.upper()
+            for compound in self.compounds
+        ]
 
-        for stops in range(1, max_stops + 1):
+        self.min_stint_laps = min_stint_laps
+        self.max_stint_laps = max_stint_laps
+        self.max_stops = max_stops
 
-            number_of_stints = stops + 1
+        # Maximum physically valid tire age for each compound.
+        self.compound_max_age = {
+            "SOFT": 20,
+            "MEDIUM": 30,
+            "HARD": 40,
+        }
 
-            for strategy in product(
-                compounds,
-                repeat=number_of_stints,
-            ):
-
-                min_total = (
-                    number_of_stints
-                    * self.simulator.min_stint_laps
-                )
-
-                max_total = (
-                    number_of_stints
-                    * self.simulator.max_stint_laps
-                )
-
-                if not (
-                    min_total
-                    <= self.simulator.total_laps
-                    <= max_total
-                ):
-                    continue
-
-                self._generate_stint_lengths(
-                    number_of_stints,
-                    strategies,
-                    list(strategy),
-                )
-
-        return strategies
-
-    def _generate_stint_lengths(
+    def _get_compound_max_stint(
         self,
-        number_of_stints: int,
-        strategies: list[
-            tuple[list[str], list[int]]
-        ],
-        strategy: list[str],
-    ) -> None:
-        """Generate every valid combination of stint lengths."""
+        compound: str,
+    ) -> int:
+        """Return the maximum valid stint length for a compound."""
 
-        min_laps = self.simulator.min_stint_laps
-        max_laps = self.simulator.max_stint_laps
-        total_laps = self.simulator.total_laps
+        compound = compound.upper()
 
-        def generate(
+        if compound not in self.compound_max_age:
+            raise ValueError(
+                f"Unsupported compound: {compound}"
+            )
+
+        return min(
+            self.max_stint_laps,
+            self.compound_max_age[compound],
+        )
+
+    def _generate_stint_lengths_for_compounds(
+        self,
+        total_laps: int,
+        compounds: tuple[str, ...],
+    ):
+        """
+        Generate valid stint lengths for a specific compound sequence.
+
+        Each stint receives a maximum length based on its compound.
+        """
+
+        number_of_stints = len(compounds)
+
+        maximum_lengths = [
+            self._get_compound_max_stint(
+                compound
+            )
+            for compound in compounds
+        ]
+
+        def recursive(
+            stint_index: int,
             remaining_laps: int,
-            remaining_stints: int,
-            lengths: list[int],
-        ) -> None:
+            current_lengths: list[int],
+        ):
+            """Recursively generate valid stint-length combinations."""
 
-            if remaining_stints == 1:
+            # Last stint.
+            if stint_index == number_of_stints - 1:
+
+                final_length = remaining_laps
 
                 if (
-                    min_laps
-                    <= remaining_laps
-                    <= max_laps
+                    self.min_stint_laps
+                    <= final_length
+                    <= maximum_lengths[
+                        stint_index
+                    ]
                 ):
-                    strategies.append(
-                        (
-                            strategy,
-                            lengths
-                            + [remaining_laps],
-                        )
-                    )
+                    yield current_lengths + [
+                        final_length
+                    ]
 
                 return
 
-            minimum_remaining = (
-                (remaining_stints - 1)
-                * min_laps
+            remaining_stints = (
+                number_of_stints
+                - stint_index
+                - 1
             )
 
-            maximum_remaining = (
-                (remaining_stints - 1)
-                * max_laps
+            # Minimum laps required by all remaining stints.
+            min_remaining = (
+                remaining_stints
+                * self.min_stint_laps
             )
 
-            for stint_length in range(
-                min_laps,
-                max_laps + 1,
+            # Maximum laps available from all remaining
+            # compounds.
+            max_remaining = sum(
+                maximum_lengths[
+                    stint_index + 1:
+                ]
+            )
+
+            current_min = max(
+                self.min_stint_laps,
+                remaining_laps
+                - max_remaining,
+            )
+
+            current_max = min(
+                maximum_lengths[
+                    stint_index
+                ],
+                remaining_laps
+                - min_remaining,
+            )
+
+            if current_min > current_max:
+                return
+
+            for length in range(
+                current_min,
+                current_max + 1,
             ):
-
-                remaining = (
-                    remaining_laps
-                    - stint_length
+                yield from recursive(
+                    stint_index + 1,
+                    remaining_laps - length,
+                    current_lengths + [
+                        length
+                    ],
                 )
 
-                if (
-                    minimum_remaining
-                    <= remaining
-                    <= maximum_remaining
+        yield from recursive(
+            stint_index=0,
+            remaining_laps=total_laps,
+            current_lengths=[],
+        )
+
+    def generate_strategies(self):
+        """
+        Generate all valid compound/stint combinations.
+
+        Each strategy is represented as:
+
+        {
+            "compounds": [...],
+            "stint_lengths": [...]
+        }
+
+        Tire-age limits are respected for every compound.
+        """
+
+        strategies = []
+
+        total_laps = self.simulator.total_laps
+
+        for stops in range(
+            1,
+            self.max_stops + 1,
+        ):
+            number_of_stints = stops + 1
+
+            compound_combinations = product(
+                self.compounds,
+                repeat=number_of_stints,
+            )
+
+            for compounds in compound_combinations:
+
+                # Skip unsupported compounds.
+                if any(
+                    compound
+                    not in self.compound_max_age
+                    for compound in compounds
                 ):
-                    generate(
-                        remaining,
-                        remaining_stints - 1,
-                        lengths
-                        + [stint_length],
+                    continue
+
+                stint_lengths = (
+                    self._generate_stint_lengths_for_compounds(
+                        total_laps=total_laps,
+                        compounds=compounds,
+                    )
+                )
+
+                for lengths in stint_lengths:
+
+                    strategies.append(
+                        {
+                            "compounds": list(
+                                compounds
+                            ),
+                            "stint_lengths": list(
+                                lengths
+                            ),
+                        }
                     )
 
-        generate(
-            total_laps,
-            number_of_stints,
-            [],
-        )
+        return strategies
 
     def evaluate(
         self,
-        strategies: list[
-            tuple[list[str], list[int]]
-        ],
-    ) -> list[StrategyResult]:
-        """Evaluate all valid strategies."""
-
-        if not strategies:
-            raise ValueError(
-                "No strategies provided."
-            )
+        strategies: list[dict],
+    ):
+        """Evaluate all generated strategies."""
 
         results = []
 
-        for strategy, stint_lengths in strategies:
-
-            try:
-                result = self.simulator.simulate(
-                    strategy,
-                    stint_lengths,
-                )
-
-                results.append(result)
-
-            except ValueError:
-                continue
-
-        if not results:
-            raise ValueError(
-                "No valid strategies available."
-            )
-
-        return sorted(
-            results,
-            key=lambda result: result.total_time,
+        total_strategies = len(
+            strategies
         )
 
-    def optimize(
-        self,
-        strategies: list[
-            tuple[list[str], list[int]]
-        ],
-    ) -> StrategyResult:
-        """Return the fastest valid strategy."""
+        for index, strategy in enumerate(
+            strategies,
+            start=1,
+        ):
 
-        results = self.evaluate(strategies)
+            simulation = (
+                self.simulator.simulate(
+                    compounds=strategy[
+                        "compounds"
+                    ],
+                    stint_lengths=strategy[
+                        "stint_lengths"
+                    ],
+                )
+            )
 
-        return results[0]
+            results.append(
+                {
+                    "compounds": simulation[
+                        "compounds"
+                    ],
+                    "stint_lengths": simulation[
+                        "stint_lengths"
+                    ],
+                    "pit_stops": simulation[
+                        "pit_stops"
+                    ],
+                    "total_time": simulation[
+                        "total_time"
+                    ],
+                    "total_time_minutes": simulation[
+                        "total_time_minutes"
+                    ],
+                    "laps": simulation[
+                        "laps"
+                    ],
+                }
+            )
+
+            if index % 5000 == 0:
+                print(
+                    f"Evaluated "
+                    f"{index:,} / "
+                    f"{total_strategies:,} strategies"
+                )
+
+        results.sort(
+            key=lambda result: result[
+                "total_time"
+            ]
+        )
+
+        return results
+
+    def optimize(self):
+        """Generate, evaluate, and rank all valid strategies."""
+
+        print(
+            "Generating strategies..."
+        )
+
+        strategies = (
+            self.generate_strategies()
+        )
+
+        print(
+            f"Total strategies generated: "
+            f"{len(strategies):,}"
+        )
+
+        if not strategies:
+            raise ValueError(
+                "No valid strategies could be generated "
+                "for the configured race length and "
+                "stint constraints."
+            )
+
+        print(
+            "Evaluating strategies..."
+        )
+
+        results = self.evaluate(
+            strategies
+        )
+
+        return results
 
 
 if __name__ == "__main__":
+
+    import time
+
+    print()
+    print("=" * 70)
+    print("F1 RACE STRATEGY OPTIMIZER")
+    print("=" * 70)
+
+    start_time = time.perf_counter()
 
     simulator = StrategySimulator(
         total_laps=53,
@@ -207,41 +351,54 @@ if __name__ == "__main__":
     )
 
     optimizer = StrategyOptimizer(
-        simulator
-    )
-
-    print()
-    print("=" * 70)
-    print("F1 RACE STRATEGY OPTIMIZER")
-    print("=" * 70)
-
-    print()
-    print("Generating strategies...")
-
-    strategies = optimizer.generate_strategies(
-        compounds=[
-            "SOFT",
-            "MEDIUM",
-            "HARD",
-        ],
+        simulator=simulator,
         max_stops=2,
     )
 
-    print(
-        f"Total strategies generated: "
-        f"{len(strategies):,}"
+    results = optimizer.optimize()
+
+    best_strategy = results[0]
+
+    elapsed = (
+        time.perf_counter()
+        - start_time
     )
 
     print()
-    print("Evaluating strategies...")
+    print("=" * 70)
+    print("BEST STRATEGY")
+    print("=" * 70)
 
-    results = optimizer.evaluate(
-        strategies
+    print(
+        "Strategy: "
+        + " -> ".join(
+            best_strategy["compounds"]
+        )
     )
 
     print(
-        f"Strategies evaluated: "
-        f"{len(results):,}"
+        f"Stints: "
+        f"{best_strategy['stint_lengths']}"
+    )
+
+    print(
+        f"Pit stops: "
+        f"{best_strategy['pit_stops']}"
+    )
+
+    print(
+        f"Predicted race time: "
+        f"{best_strategy['total_time']:.2f} sec"
+    )
+
+    print(
+        f"Predicted race time: "
+        f"{best_strategy['total_time_minutes']:.2f} min"
+    )
+
+    print(
+        f"Optimization time: "
+        f"{elapsed:.2f} sec"
     )
 
     print()
@@ -249,53 +406,23 @@ if __name__ == "__main__":
     print("TOP 10 STRATEGIES")
     print("=" * 70)
 
-    for rank, result in enumerate(
+    for rank, strategy in enumerate(
         results[:10],
         start=1,
     ):
-
         strategy_name = " -> ".join(
-            result.strategy
+            strategy["compounds"]
         )
 
         print(
-            f"{rank:2}. "
+            f"#{rank:<2} "
             f"{strategy_name:<25} "
-            f"Stints={str(result.stint_lengths):<12} "
-            f"Stops={result.pit_stops} "
-            f"Time={result.total_time:.2f}s"
+            f"Stints: "
+            f"{strategy['stint_lengths']} "
+            f"| Stops: "
+            f"{strategy['pit_stops']} "
+            f"| Time: "
+            f"{strategy['total_time']:.2f} sec"
         )
-
-    best = results[0]
-
-    print()
-    print("=" * 70)
-    print("🏆 OPTIMAL STRATEGY")
-    print("=" * 70)
-
-    print(
-        f"Strategy      : "
-        f"{' -> '.join(best.strategy)}"
-    )
-
-    print(
-        f"Stint lengths : "
-        f"{best.stint_lengths}"
-    )
-
-    print(
-        f"Pit stops     : "
-        f"{best.pit_stops}"
-    )
-
-    print(
-        f"Race time     : "
-        f"{best.total_time:.2f} sec"
-    )
-
-    print(
-        f"Race time     : "
-        f"{best.total_time / 60:.2f} min"
-    )
 
     print("=" * 70)
